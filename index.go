@@ -1,6 +1,7 @@
 package log_file
 
 import (
+	"github.com/infrago/infra"
 	"github.com/infrago/log"
 )
 
@@ -13,5 +14,5 @@ func Driver(ss ...string) log.Driver {
 }
 
 func init() {
-	log.Register("file", Driver("store/logs"))
+	infra.Register("file", Driver("store/logs"))
 }
