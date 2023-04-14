@@ -129,16 +129,27 @@ func (this *fileConnect) Open() error {
 
 // 关闭连接
 func (this *fileConnect) Close() error {
+	for _, writer := range this.writers {
+		writer.writer.Close()
+	}
 	//为了最后一条日志能正常输出，延迟一小会
 	time.Sleep(time.Microsecond * 100)
-	this.Flush()
+	return nil
+}
+
+func (this *fileConnect) Write(msgs ...log.Log) error {
+	for _, msg := range msgs {
+		if err := this.writing(msg); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 // Write 写日志
 // 可以考虑换成封闭好的协程库来执行并行任务
 // 老代码搬运，暂时先这样
-func (this *fileConnect) Write(log log.Log) error {
+func (this *fileConnect) writing(log log.Log) error {
 
 	msg := this.instance.Format(log)
 
@@ -192,10 +203,4 @@ func (this *fileConnect) Write(log log.Log) error {
 		return levelErr.(error)
 	}
 	return nil
-}
-
-func (this *fileConnect) Flush() {
-	for _, writer := range this.writers {
-		writer.writer.Close()
-	}
 }
