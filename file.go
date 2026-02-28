@@ -28,6 +28,9 @@ type (
 		maxSize    int64
 		slice      string
 		maxLine    int64
+		compress   bool
+		maxFiles   int
+		maxAge     time.Duration
 	}
 )
 
@@ -37,14 +40,17 @@ func init() {
 	bamgoo.Register("file", &fileDriver{})
 }
 
-func (d *fileDriver) Connect(inst *blog.Instance) (blog.Connect, error) {
+func (d *fileDriver) Connect(inst *blog.Instance) (blog.Connection, error) {
 	setting := fileSetting{
-		store:      "logs",
+		store:      "store/log",
 		output:     "",
 		levelFiles: map[blog.Level]string{},
 		maxSize:    100 * 1024 * 1024,
 		slice:      "",
 		maxLine:    0,
+		compress:   false,
+		maxFiles:   0,
+		maxAge:     0,
 	}
 
 	if v, ok := getString(inst.Setting, "store"); ok && v != "" {
@@ -70,6 +76,20 @@ func (d *fileDriver) Connect(inst *blog.Instance) (blog.Connect, error) {
 	}
 	if v, ok := getInt64(inst.Setting, "maxline"); ok && v > 0 {
 		setting.maxLine = v
+	}
+	if v, ok := getInt64(inst.Setting, "maxfiles"); ok && v > 0 {
+		setting.maxFiles = int(v)
+	}
+	if v, ok := getString(inst.Setting, "maxage"); ok && v != "" {
+		if d, ok := parseAge(v); ok && d > 0 {
+			setting.maxAge = d
+		}
+	}
+	if v, ok := getInt64(inst.Setting, "maxage"); ok && v > 0 {
+		setting.maxAge = time.Second * time.Duration(v)
+	}
+	if v, ok := getBool(inst.Setting, "compress"); ok {
+		setting.compress = v
 	}
 
 	levels := blog.Levels()
@@ -98,7 +118,7 @@ func (d *fileDriver) Connect(inst *blog.Instance) (blog.Connect, error) {
 func (c *fileConnection) Open() error {
 	if c.setting.output != "" {
 		path := c.resolvePath(c.setting.output)
-		w, err := newRotatingWriter(path, c.setting.maxSize, c.setting.slice, c.setting.maxLine)
+		w, err := newRotatingWriter(path, c.setting.maxSize, c.setting.slice, c.setting.maxLine, c.setting.compress, c.setting.maxFiles, c.setting.maxAge)
 		if err != nil {
 			return err
 		}
@@ -107,7 +127,7 @@ func (c *fileConnection) Open() error {
 
 	for level, file := range c.setting.levelFiles {
 		path := c.resolvePath(file)
-		w, err := newRotatingWriter(path, c.setting.maxSize, c.setting.slice, c.setting.maxLine)
+		w, err := newRotatingWriter(path, c.setting.maxSize, c.setting.slice, c.setting.maxLine, c.setting.compress, c.setting.maxFiles, c.setting.maxAge)
 		if err != nil {
 			return err
 		}
@@ -127,18 +147,29 @@ func (c *fileConnection) Close() error {
 }
 
 func (c *fileConnection) Write(logs ...blog.Log) error {
+	if len(logs) == 0 {
+		return nil
+	}
+	outputLines := make([]string, 0, len(logs))
+	levelLines := map[blog.Level][]string{}
 	for _, entry := range logs {
 		line := c.instance.Format(entry)
+		outputLines = append(outputLines, line)
+		levelLines[entry.Level] = append(levelLines[entry.Level], line)
+	}
 
-		if writer, ok := c.writers[outputBucket]; ok {
-			if err := writer.WriteLine(line); err != nil {
-				return err
-			}
+	if writer, ok := c.writers[outputBucket]; ok {
+		if err := writer.WriteLines(outputLines); err != nil {
+			return err
 		}
-		if writer, ok := c.writers[entry.Level]; ok {
-			if err := writer.WriteLine(line); err != nil {
-				return err
-			}
+	}
+	for level, lines := range levelLines {
+		writer, ok := c.writers[level]
+		if !ok {
+			continue
+		}
+		if err := writer.WriteLines(lines); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -252,6 +283,41 @@ func parseSize(raw string) (int64, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+func parseAge(raw string) (time.Duration, bool) {
+	value := strings.TrimSpace(strings.ToLower(raw))
+	if value == "" {
+		return 0, false
+	}
+	if d, err := time.ParseDuration(value); err == nil {
+		return d, true
+	}
+
+	units := []struct {
+		suffix string
+		scale  time.Duration
+	}{
+		{"w", 7 * 24 * time.Hour},
+		{"d", 24 * time.Hour},
+		{"h", time.Hour},
+		{"m", time.Minute},
+		{"s", time.Second},
+	}
+	for _, unit := range units {
+		if strings.HasSuffix(value, unit.suffix) {
+			number := strings.TrimSpace(strings.TrimSuffix(value, unit.suffix))
+			if number == "" {
+				return 0, false
+			}
+			n, err := strconv.ParseFloat(number, 64)
+			if err != nil {
+				return 0, false
+			}
+			return time.Duration(n * float64(unit.scale)), true
+		}
+	}
+	return 0, false
 }
 
 func rotatedName(filename string, now time.Time) string {
