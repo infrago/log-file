@@ -1,46 +1,40 @@
 # log-file
 
-`log-file` 是 `log` 模块的 `file` 驱动。
+`log-file` 是 `github.com/infrago/log` 的**file 驱动**。
 
-## 安装
+## 包定位
 
-```bash
-go get github.com/infrago/log@latest
-go get github.com/infrago/log-file@latest
-```
+- 类型：驱动
+- 作用：把 `log` 模块的统一接口落到 `file` 后端实现
 
-## 接入
+## 快速接入
 
 ```go
 import (
     _ "github.com/infrago/log"
     _ "github.com/infrago/log-file"
-    "github.com/infrago/infra"
 )
-
-func main() {
-    infra.Run()
-}
 ```
-
-## 配置示例
 
 ```toml
 [log]
 driver = "file"
 ```
 
-## 公开 API（摘自源码）
+## `setting` 专用配置项
 
-- `func (w *rotatingWriter) Close() error`
-- `func (w *rotatingWriter) WriteLine(line string) error`
-- `func (w *rotatingWriter) WriteLines(lines []string) error`
-- `func (d *fileDriver) Connect(inst *blog.Instance) (blog.Connection, error)`
-- `func (c *fileConnection) Open() error`
-- `func (c *fileConnection) Close() error`
-- `func (c *fileConnection) Write(logs ...blog.Log) error`
+配置位置：`[log].setting`
 
-## 排错
+- `store`
+- `output`
+- `maxsize`
+- `slice`
+- `maxline`
+- `maxfiles`
+- `maxage`
+- `compress`
 
-- driver 未生效：确认模块段 `driver` 值与驱动名一致
-- 连接失败：检查 endpoint/host/port/鉴权配置
+## 说明
+
+- `setting` 仅对当前驱动生效，不同驱动键名可能不同
+- 连接失败时优先核对 `setting` 中 host/port/认证/超时等参数
