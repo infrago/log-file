@@ -1,3 +1,3 @@
-module github.com/bamgoo/log-file
+module github.com/infrago/log-file
 
 go 1.25.3

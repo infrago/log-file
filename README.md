@@ -1,5 +1,5 @@
 # log-file
-file driver for bamgoo/log.
+file driver for infrago/log.
 
 settings:
 
@@ -12,4 +12,4 @@ settings:
 - `maxfiles`: keep latest N rotated files
 - `maxage`: delete rotated files older than duration (e.g. `7d`, `72h`)
 - `compress`: compress rotated files to `.gz` asynchronously
-bamgoo file log driver.
+infrago file log driver.
