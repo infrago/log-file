@@ -33,8 +33,12 @@ driver = "file"
 - `maxfiles`
 - `maxage`
 - `compress`
+- `close_timeout`
+- `flush_interval`
+- `cleanup_interval`
 
 ## 说明
 
 - `setting` 仅对当前驱动生效，不同驱动键名可能不同
+- `flush_interval` 默认关闭，关闭时仍会强制 flush；`cleanup_interval` 默认关闭，关闭时仍会强制清理
 - 连接失败时优先核对 `setting` 中 host/port/认证/超时等参数

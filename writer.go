@@ -20,28 +20,42 @@ type rotatingWriter struct {
 	buffer   *bufio.Writer
 	filename string
 
-	size     int64
-	lines    int64
-	maxSize  int64
-	maxLine  int64
-	slice    string
-	compress bool
-	maxFiles int
-	maxAge   time.Duration
+	size         int64
+	lines        int64
+	maxSize      int64
+	maxLine      int64
+	slice        string
+	compress     bool
+	maxFiles     int
+	maxAge       time.Duration
+	closeTimeout time.Duration
+	flushEvery   time.Duration
+	cleanupEvery time.Duration
 
-	startTime time.Time
+	startTime   time.Time
+	lastFlush   time.Time
+	lastCleanup time.Time
+
+	compressMu     sync.Mutex
+	compressActive int
+	compressDone   chan struct{}
 }
 
-func newRotatingWriter(filename string, maxSize int64, slice string, maxLine int64, compress bool, maxFiles int, maxAge time.Duration) (*rotatingWriter, error) {
+func newRotatingWriter(filename string, maxSize int64, slice string, maxLine int64, compress bool, maxFiles int, maxAge, closeTimeout, flushEvery, cleanupEvery time.Duration) (*rotatingWriter, error) {
 	w := &rotatingWriter{
-		filename: filename,
-		maxSize:  maxSize,
-		maxLine:  maxLine,
-		slice:    slice,
-		compress: compress,
-		maxFiles: maxFiles,
-		maxAge:   maxAge,
+		filename:     filename,
+		maxSize:      maxSize,
+		maxLine:      maxLine,
+		slice:        slice,
+		compress:     compress,
+		maxFiles:     maxFiles,
+		maxAge:       maxAge,
+		closeTimeout: closeTimeout,
+		flushEvery:   flushEvery,
+		cleanupEvery: cleanupEvery,
 	}
+	w.compressDone = make(chan struct{})
+	close(w.compressDone)
 	if err := w.open(); err != nil {
 		return nil, err
 	}
@@ -67,7 +81,8 @@ func (w *rotatingWriter) open() error {
 	w.file = file
 	w.buffer = bufio.NewWriterSize(file, 64*1024)
 	w.size = info.Size()
-	w.startTime = time.Now()
+	w.startTime = info.ModTime()
+	w.lastFlush = time.Now()
 	return nil
 }
 
@@ -87,7 +102,35 @@ func (w *rotatingWriter) Close() error {
 		}
 		w.file = nil
 	}
+	if e := w.cleanup(true); e != nil && err == nil {
+		err = e
+	}
+	waitErr := w.waitCompression()
+	if err == nil {
+		err = waitErr
+	}
 	return err
+}
+
+func (w *rotatingWriter) waitCompression() error {
+	w.compressMu.Lock()
+	if w.compressActive == 0 {
+		w.compressMu.Unlock()
+		return nil
+	}
+	done := w.compressDone
+	w.compressMu.Unlock()
+
+	if w.closeTimeout <= 0 {
+		<-done
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-time.After(w.closeTimeout):
+		return fmt.Errorf("log-file compression close timeout after %s", w.closeTimeout)
+	}
 }
 
 func (w *rotatingWriter) WriteLine(line string) error {
@@ -121,9 +164,28 @@ func (w *rotatingWriter) WriteLines(lines []string) error {
 		w.lines++
 	}
 
-	// Flush once per batch to reduce syscall overhead while keeping a bounded
-	// durability window (controlled by module flush interval).
-	return w.buffer.Flush()
+	return w.flushIfDue()
+}
+
+func (w *rotatingWriter) flushIfDue() error {
+	if w.flushEvery <= 0 {
+		return w.flushBuffer()
+	}
+	if time.Since(w.lastFlush) < w.flushEvery {
+		return nil
+	}
+	return w.flushBuffer()
+}
+
+func (w *rotatingWriter) flushBuffer() error {
+	if w.buffer == nil {
+		return nil
+	}
+	if err := w.buffer.Flush(); err != nil {
+		return err
+	}
+	w.lastFlush = time.Now()
+	return nil
 }
 
 func (w *rotatingWriter) shouldRotate(incoming int64) bool {
@@ -143,10 +205,8 @@ func (w *rotatingWriter) shouldRotate(incoming int64) bool {
 }
 
 func (w *rotatingWriter) rotate() error {
-	if w.buffer != nil {
-		if err := w.buffer.Flush(); err != nil {
-			return err
-		}
+	if err := w.flushBuffer(); err != nil {
+		return err
 	}
 	if w.file != nil {
 		if err := w.file.Close(); err != nil {
@@ -155,15 +215,22 @@ func (w *rotatingWriter) rotate() error {
 	}
 
 	if _, err := os.Stat(w.filename); err == nil {
-		rotated := rotatedName(w.filename, time.Now())
+		rotated, err := nextRotatedName(w.filename, time.Now())
+		if err != nil {
+			return err
+		}
 		if err := os.Rename(w.filename, rotated); err != nil {
 			return err
 		}
 		if w.compress {
-			go compressRotatedFile(rotated)
+			w.beginCompression()
+			go func() {
+				defer w.finishCompression()
+				compressRotatedFile(rotated)
+			}()
 		}
 	}
-	if err := w.cleanup(); err != nil {
+	if err := w.cleanup(false); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "log-file cleanup failed: %v\n", err)
 	}
 
@@ -173,6 +240,24 @@ func (w *rotatingWriter) rotate() error {
 	w.lines = 0
 	w.startTime = time.Now()
 	return w.open()
+}
+
+func (w *rotatingWriter) beginCompression() {
+	w.compressMu.Lock()
+	if w.compressActive == 0 {
+		w.compressDone = make(chan struct{})
+	}
+	w.compressActive++
+	w.compressMu.Unlock()
+}
+
+func (w *rotatingWriter) finishCompression() {
+	w.compressMu.Lock()
+	w.compressActive--
+	if w.compressActive == 0 {
+		close(w.compressDone)
+	}
+	w.compressMu.Unlock()
 }
 
 func sameSliceWindow(slice string, a, b time.Time) bool {
@@ -199,10 +284,15 @@ type rotatedFile struct {
 	at   time.Time
 }
 
-func (w *rotatingWriter) cleanup() error {
+func (w *rotatingWriter) cleanup(force bool) error {
 	if w.maxFiles <= 0 && w.maxAge <= 0 {
 		return nil
 	}
+	now := time.Now()
+	if !force && w.cleanupEvery > 0 && !w.lastCleanup.IsZero() && now.Sub(w.lastCleanup) < w.cleanupEvery {
+		return nil
+	}
+	w.lastCleanup = now
 
 	dir := filepath.Dir(w.filename)
 	entries, err := os.ReadDir(dir)
@@ -212,7 +302,6 @@ func (w *rotatingWriter) cleanup() error {
 
 	ext := filepath.Ext(w.filename)
 	base := strings.TrimSuffix(filepath.Base(w.filename), ext)
-	now := time.Now()
 	candidates := make([]rotatedFile, 0, len(entries))
 
 	for _, entry := range entries {
@@ -258,11 +347,13 @@ func parseRotatedTimestamp(name, base, ext string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 
-	t, err := time.Parse("20060102.150405", ts)
-	if err != nil {
-		return time.Time{}, false
+	for _, layout := range []string{"20060102.150405.000000000", "20060102.150405"} {
+		t, err := time.ParseInLocation(layout, ts, time.Local)
+		if err == nil {
+			return t, true
+		}
 	}
-	return t, true
+	return time.Time{}, false
 }
 
 func compressRotatedFile(path string) {

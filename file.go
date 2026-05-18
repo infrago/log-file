@@ -2,13 +2,15 @@ package log_file
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/infrago/infra"
 	. "github.com/infrago/base"
+	"github.com/infrago/infra"
 	blog "github.com/infrago/log"
 )
 
@@ -16,21 +18,27 @@ type (
 	fileDriver struct{}
 
 	fileConnection struct {
-		instance *blog.Instance
-		setting  fileSetting
-		writers  map[blog.Level]*rotatingWriter
+		instance    *blog.Instance
+		setting     fileSetting
+		writers     map[blog.Level]*rotatingWriter
+		writerIndex map[*rotatingWriter]int
+		writerList  []*rotatingWriter
+		lineGroups  sync.Pool
 	}
 
 	fileSetting struct {
-		store      string
-		output     string
-		levelFiles map[blog.Level]string
-		maxSize    int64
-		slice      string
-		maxLine    int64
-		compress   bool
-		maxFiles   int
-		maxAge     time.Duration
+		store        string
+		output       string
+		levelFiles   map[blog.Level]string
+		maxSize      int64
+		slice        string
+		maxLine      int64
+		compress     bool
+		maxFiles     int
+		maxAge       time.Duration
+		closeTimeout time.Duration
+		flushEvery   time.Duration
+		cleanupEvery time.Duration
 	}
 )
 
@@ -42,15 +50,18 @@ func init() {
 
 func (d *fileDriver) Connect(inst *blog.Instance) (blog.Connection, error) {
 	setting := fileSetting{
-		store:      "store/log",
-		output:     "",
-		levelFiles: map[blog.Level]string{},
-		maxSize:    100 * 1024 * 1024,
-		slice:      "",
-		maxLine:    0,
-		compress:   false,
-		maxFiles:   0,
-		maxAge:     0,
+		store:        "store/log",
+		output:       "",
+		levelFiles:   map[blog.Level]string{},
+		maxSize:      100 * 1024 * 1024,
+		slice:        "",
+		maxLine:      0,
+		compress:     false,
+		maxFiles:     0,
+		maxAge:       0,
+		closeTimeout: 0,
+		flushEvery:   0,
+		cleanupEvery: 0,
 	}
 
 	if v, ok := getString(inst.Setting, "store"); ok && v != "" {
@@ -91,6 +102,54 @@ func (d *fileDriver) Connect(inst *blog.Instance) (blog.Connection, error) {
 	if v, ok := getBool(inst.Setting, "compress"); ok {
 		setting.compress = v
 	}
+	if v, ok := getString(inst.Setting, "close_timeout"); ok && v != "" {
+		if d, ok := parseAge(v); ok && d > 0 {
+			setting.closeTimeout = d
+		}
+	}
+	if v, ok := getString(inst.Setting, "closetimeout"); ok && v != "" {
+		if d, ok := parseAge(v); ok && d > 0 {
+			setting.closeTimeout = d
+		}
+	}
+	if v, ok := getInt64(inst.Setting, "close_timeout"); ok && v > 0 {
+		setting.closeTimeout = time.Second * time.Duration(v)
+	}
+	if v, ok := getInt64(inst.Setting, "closetimeout"); ok && v > 0 {
+		setting.closeTimeout = time.Second * time.Duration(v)
+	}
+	if v, ok := getString(inst.Setting, "flush_interval"); ok && v != "" {
+		if d, ok := parseAge(v); ok && d > 0 {
+			setting.flushEvery = d
+		}
+	}
+	if v, ok := getString(inst.Setting, "flushinterval"); ok && v != "" {
+		if d, ok := parseAge(v); ok && d > 0 {
+			setting.flushEvery = d
+		}
+	}
+	if v, ok := getInt64(inst.Setting, "flush_interval"); ok && v > 0 {
+		setting.flushEvery = time.Second * time.Duration(v)
+	}
+	if v, ok := getInt64(inst.Setting, "flushinterval"); ok && v > 0 {
+		setting.flushEvery = time.Second * time.Duration(v)
+	}
+	if v, ok := getString(inst.Setting, "cleanup_interval"); ok && v != "" {
+		if d, ok := parseAge(v); ok && d > 0 {
+			setting.cleanupEvery = d
+		}
+	}
+	if v, ok := getString(inst.Setting, "cleanupinterval"); ok && v != "" {
+		if d, ok := parseAge(v); ok && d > 0 {
+			setting.cleanupEvery = d
+		}
+	}
+	if v, ok := getInt64(inst.Setting, "cleanup_interval"); ok && v > 0 {
+		setting.cleanupEvery = time.Second * time.Duration(v)
+	}
+	if v, ok := getInt64(inst.Setting, "cleanupinterval"); ok && v > 0 {
+		setting.cleanupEvery = time.Second * time.Duration(v)
+	}
 
 	levels := blog.Levels()
 	for level, name := range levels {
@@ -116,9 +175,34 @@ func (d *fileDriver) Connect(inst *blog.Instance) (blog.Connection, error) {
 }
 
 func (c *fileConnection) Open() error {
+	byPath := map[string]*rotatingWriter{}
+	c.writerIndex = map[*rotatingWriter]int{}
+	c.writerList = nil
+	registerWriter := func(writer *rotatingWriter) {
+		if _, ok := c.writerIndex[writer]; ok {
+			return
+		}
+		c.writerIndex[writer] = len(c.writerList)
+		c.writerList = append(c.writerList, writer)
+	}
+	openWriter := func(file string) (*rotatingWriter, error) {
+		path := c.resolvePath(file)
+		key := canonicalPath(path)
+		if writer, ok := byPath[key]; ok {
+			return writer, nil
+		}
+		writer, err := newRotatingWriter(path, c.setting.maxSize, c.setting.slice, c.setting.maxLine, c.setting.compress, c.setting.maxFiles, c.setting.maxAge, c.setting.closeTimeout, c.setting.flushEvery, c.setting.cleanupEvery)
+		if err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+		byPath[key] = writer
+		registerWriter(writer)
+		return writer, nil
+	}
+
 	if c.setting.output != "" {
-		path := c.resolvePath(c.setting.output)
-		w, err := newRotatingWriter(path, c.setting.maxSize, c.setting.slice, c.setting.maxLine, c.setting.compress, c.setting.maxFiles, c.setting.maxAge)
+		w, err := openWriter(c.setting.output)
 		if err != nil {
 			return err
 		}
@@ -126,8 +210,7 @@ func (c *fileConnection) Open() error {
 	}
 
 	for level, file := range c.setting.levelFiles {
-		path := c.resolvePath(file)
-		w, err := newRotatingWriter(path, c.setting.maxSize, c.setting.slice, c.setting.maxLine, c.setting.compress, c.setting.maxFiles, c.setting.maxAge)
+		w, err := openWriter(file)
 		if err != nil {
 			return err
 		}
@@ -138,7 +221,12 @@ func (c *fileConnection) Open() error {
 
 func (c *fileConnection) Close() error {
 	var closeErr error
+	closed := map[*rotatingWriter]bool{}
 	for _, writer := range c.writers {
+		if closed[writer] {
+			continue
+		}
+		closed[writer] = true
 		if err := writer.Close(); err != nil && closeErr == nil {
 			closeErr = err
 		}
@@ -150,29 +238,69 @@ func (c *fileConnection) Write(logs ...blog.Log) error {
 	if len(logs) == 0 {
 		return nil
 	}
-	outputLines := make([]string, 0, len(logs))
-	levelLines := map[blog.Level][]string{}
+	linesPtr := c.getLineGroups()
+	linesByWriter := *linesPtr
+	defer c.putLineGroups(linesPtr)
+	outputWriter := c.writers[outputBucket]
+	outputIndex := -1
+	if outputWriter != nil {
+		outputIndex = c.writerIndex[outputWriter]
+	}
 	for _, entry := range logs {
 		line := c.instance.Format(entry)
-		outputLines = append(outputLines, line)
-		levelLines[entry.Level] = append(levelLines[entry.Level], line)
-	}
-
-	if writer, ok := c.writers[outputBucket]; ok {
-		if err := writer.WriteLines(outputLines); err != nil {
-			return err
+		if outputIndex >= 0 {
+			linesByWriter[outputIndex] = append(linesByWriter[outputIndex], line)
+		}
+		if writer, ok := c.writers[entry.Level]; ok && writer != outputWriter {
+			idx := c.writerIndex[writer]
+			linesByWriter[idx] = append(linesByWriter[idx], line)
 		}
 	}
-	for level, lines := range levelLines {
-		writer, ok := c.writers[level]
-		if !ok {
+	for idx, lines := range linesByWriter {
+		if len(lines) == 0 {
 			continue
 		}
-		if err := writer.WriteLines(lines); err != nil {
+		if err := c.writerList[idx].WriteLines(lines); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (c *fileConnection) getLineGroups() *[][]string {
+	if value := c.lineGroups.Get(); value != nil {
+		linesPtr := value.(*[][]string)
+		lines := *linesPtr
+		if cap(lines) >= len(c.writerList) {
+			lines = lines[:len(c.writerList)]
+			for i := range lines {
+				lines[i] = lines[i][:0]
+			}
+			*linesPtr = lines
+			return linesPtr
+		}
+	}
+	lines := make([][]string, len(c.writerList))
+	return &lines
+}
+
+func (c *fileConnection) putLineGroups(linesPtr *[][]string) {
+	lines := *linesPtr
+	for i := range lines {
+		for j := range lines[i] {
+			lines[i][j] = ""
+		}
+		if cap(lines[i]) > 4096 {
+			lines[i] = nil
+			continue
+		}
+		lines[i] = lines[i][:0]
+	}
+	if cap(lines) > 64 {
+		return
+	}
+	*linesPtr = lines[:0]
+	c.lineGroups.Put(linesPtr)
 }
 
 func (c *fileConnection) resolvePath(file string) string {
@@ -180,6 +308,24 @@ func (c *fileConnection) resolvePath(file string) string {
 		return file
 	}
 	return filepath.Join(c.setting.store, file)
+}
+
+func canonicalPath(path string) string {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		if abs, err := filepath.Abs(real); err == nil {
+			return abs
+		}
+		return real
+	}
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	if realDir, err := filepath.EvalSymlinks(dir); err == nil {
+		path = filepath.Join(realDir, base)
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return path
 }
 
 func getString(m Map, key string) (string, bool) {
@@ -323,5 +469,17 @@ func parseAge(raw string) (time.Duration, bool) {
 func rotatedName(filename string, now time.Time) string {
 	ext := filepath.Ext(filename)
 	base := strings.TrimSuffix(filename, ext)
-	return fmt.Sprintf("%s.%s%s", base, now.Format("20060102.150405"), ext)
+	return fmt.Sprintf("%s.%s%s", base, now.Format("20060102.150405.000000000"), ext)
+}
+
+func nextRotatedName(filename string, now time.Time) (string, error) {
+	for i := 0; ; i++ {
+		candidate := rotatedName(filename, now.Add(time.Duration(i)))
+		if _, err := os.Stat(candidate); err != nil {
+			if os.IsNotExist(err) {
+				return candidate, nil
+			}
+			return "", err
+		}
+	}
 }
