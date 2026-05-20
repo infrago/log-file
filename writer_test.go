@@ -223,6 +223,42 @@ func TestRotatingWriterFlushIntervalDelaysFlushUntilClose(t *testing.T) {
 	}
 }
 
+func TestFileConnectionFlushIntervalFlushesWithoutClose(t *testing.T) {
+	dir := t.TempDir()
+	conn := &fileConnection{
+		instance: &blog.Instance{Config: blog.Config{Format: "%body%"}},
+		setting: fileSetting{
+			store:      dir,
+			output:     "app.log",
+			levelFiles: map[blog.Level]string{},
+			maxSize:    1024,
+			flushEvery: 20 * time.Millisecond,
+		},
+		writers: map[blog.Level]*rotatingWriter{},
+	}
+	if err := conn.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if err := conn.Write(blog.Log{Time: time.Now(), Level: blog.LevelInfo, Body: "timer"}); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "app.log")
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		body, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) == "timer\n" {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("expected flush interval to flush without Close")
+}
+
 func TestRotatingWriterCleanupIntervalSkipsRepeatedScan(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "app.log")

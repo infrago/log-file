@@ -3,11 +3,11 @@ package log_file
 import (
 	"bufio"
 	"compress/gzip"
+	"container/heap"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +35,8 @@ type rotatingWriter struct {
 	startTime   time.Time
 	lastFlush   time.Time
 	lastCleanup time.Time
+	dirty       bool
+	closed      bool
 
 	compressMu     sync.Mutex
 	compressActive int
@@ -91,10 +93,9 @@ func (w *rotatingWriter) Close() error {
 	defer w.mutex.Unlock()
 
 	var err error
-	if w.buffer != nil {
-		if e := w.buffer.Flush(); e != nil {
-			err = e
-		}
+	w.closed = true
+	if e := w.flushBuffer(); e != nil {
+		err = e
 	}
 	if w.file != nil {
 		if e := w.file.Close(); e != nil && err == nil {
@@ -102,12 +103,12 @@ func (w *rotatingWriter) Close() error {
 		}
 		w.file = nil
 	}
-	if e := w.cleanup(true); e != nil && err == nil {
-		err = e
-	}
 	waitErr := w.waitCompression()
 	if err == nil {
 		err = waitErr
+	}
+	if e := w.cleanup(true); e != nil && err == nil {
+		err = e
 	}
 	return err
 }
@@ -171,9 +172,13 @@ func (w *rotatingWriter) flushIfDue() error {
 	if w.flushEvery <= 0 {
 		return w.flushBuffer()
 	}
-	if time.Since(w.lastFlush) < w.flushEvery {
-		return nil
-	}
+	w.dirty = true
+	return nil
+}
+
+func (w *rotatingWriter) Flush() error {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
 	return w.flushBuffer()
 }
 
@@ -181,9 +186,13 @@ func (w *rotatingWriter) flushBuffer() error {
 	if w.buffer == nil {
 		return nil
 	}
+	if !w.dirty && w.flushEvery > 0 {
+		return nil
+	}
 	if err := w.buffer.Flush(); err != nil {
 		return err
 	}
+	w.dirty = false
 	w.lastFlush = time.Now()
 	return nil
 }
@@ -284,6 +293,24 @@ type rotatedFile struct {
 	at   time.Time
 }
 
+type newestRotatedFiles []rotatedFile
+
+func (h newestRotatedFiles) Len() int { return len(h) }
+func (h newestRotatedFiles) Less(i, j int) bool {
+	return h[i].at.Before(h[j].at)
+}
+func (h newestRotatedFiles) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *newestRotatedFiles) Push(x any) {
+	*h = append(*h, x.(rotatedFile))
+}
+func (h *newestRotatedFiles) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
 func (w *rotatingWriter) cleanup(force bool) error {
 	if w.maxFiles <= 0 && w.maxAge <= 0 {
 		return nil
@@ -302,7 +329,10 @@ func (w *rotatingWriter) cleanup(force bool) error {
 
 	ext := filepath.Ext(w.filename)
 	base := strings.TrimSuffix(filepath.Base(w.filename), ext)
-	candidates := make([]rotatedFile, 0, len(entries))
+	var newest newestRotatedFiles
+	if w.maxFiles > 0 {
+		newest = make(newestRotatedFiles, 0, w.maxFiles)
+	}
 
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -318,15 +348,20 @@ func (w *rotatingWriter) cleanup(force bool) error {
 			_ = os.Remove(full)
 			continue
 		}
-		candidates = append(candidates, rotatedFile{path: full, at: ts})
-	}
-
-	if w.maxFiles > 0 && len(candidates) > w.maxFiles {
-		sort.Slice(candidates, func(i, j int) bool {
-			return candidates[i].at.After(candidates[j].at)
-		})
-		for _, f := range candidates[w.maxFiles:] {
-			_ = os.Remove(f.path)
+		if w.maxFiles <= 0 {
+			continue
+		}
+		current := rotatedFile{path: full, at: ts}
+		if newest.Len() < w.maxFiles {
+			heap.Push(&newest, current)
+			continue
+		}
+		if newest[0].at.Before(current.at) {
+			oldest := heap.Pop(&newest).(rotatedFile)
+			_ = os.Remove(oldest.path)
+			heap.Push(&newest, current)
+		} else {
+			_ = os.Remove(current.path)
 		}
 	}
 	return nil

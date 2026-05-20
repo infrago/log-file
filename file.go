@@ -24,6 +24,8 @@ type (
 		writerIndex map[*rotatingWriter]int
 		writerList  []*rotatingWriter
 		lineGroups  sync.Pool
+		flushStop   chan struct{}
+		flushDone   chan struct{}
 	}
 
 	fileSetting struct {
@@ -216,10 +218,12 @@ func (c *fileConnection) Open() error {
 		}
 		c.writers[level] = w
 	}
+	c.startFlushLoop()
 	return nil
 }
 
 func (c *fileConnection) Close() error {
+	c.stopFlushLoop()
 	var closeErr error
 	closed := map[*rotatingWriter]bool{}
 	for _, writer := range c.writers {
@@ -234,6 +238,40 @@ func (c *fileConnection) Close() error {
 	return closeErr
 }
 
+func (c *fileConnection) startFlushLoop() {
+	if c.setting.flushEvery <= 0 || len(c.writerList) == 0 {
+		return
+	}
+	c.flushStop = make(chan struct{})
+	c.flushDone = make(chan struct{})
+	go func() {
+		defer close(c.flushDone)
+		ticker := time.NewTicker(c.setting.flushEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				for _, writer := range c.writerList {
+					if err := writer.Flush(); err != nil {
+						_, _ = fmt.Fprintf(os.Stderr, "log-file flush failed: %v\n", err)
+					}
+				}
+			case <-c.flushStop:
+				return
+			}
+		}
+	}()
+}
+
+func (c *fileConnection) stopFlushLoop() {
+	if c.flushStop == nil {
+		return
+	}
+	close(c.flushStop)
+	<-c.flushDone
+	c.flushStop = nil
+	c.flushDone = nil
+}
 func (c *fileConnection) Write(logs ...blog.Log) error {
 	if len(logs) == 0 {
 		return nil
