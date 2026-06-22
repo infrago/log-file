@@ -3,9 +3,9 @@ module github.com/infrago/log-file
 go 1.25.3
 
 require (
-	github.com/infrago/base v0.28.0
-	github.com/infrago/infra v0.28.0
-	github.com/infrago/log v0.28.0
+	github.com/infrago/base v0.29.0
+	github.com/infrago/infra v0.29.0
+	github.com/infrago/log v0.29.0
 )
 
 require (
